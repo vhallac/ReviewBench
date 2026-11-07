@@ -21,6 +21,8 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
+import { appendFileSync } from "node:fs";
+
 import type { Finding } from "../lib/types.js";
 import type { RawCorrespondence } from "../lib/match-types.js";
 import {
@@ -100,16 +102,66 @@ interface MatcherResponse {
   }>;
 }
 
+/** Attempt to repair common LLM JSON mess-ups after a plain parse fails. */
+function repairJson(text: string): unknown | null {
+  let s = text.trim();
+  // strip markdown fences
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  // keep only the outermost object
+  const start = s.indexOf("{");
+  if (start < 0) return null;
+  s = s.slice(start);
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  if (stack.length === 0) {
+    // balanced at some point: truncate there to drop trailing prose
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') inStr = true;
+      else if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    s = s.slice(0, end + 1);
+  } else {
+    if (inString) s += '"';
+    while (stack.length) s += stack.pop() === "{" ? "}" : "]";
+  }
+  // strip trailing commas now that all closers exist
+  s = s.replace(/,\s*([}\]])/g, "$1");
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 function extractJson(text: string): unknown | null {
   try {
     return JSON.parse(text);
   } catch {
+    const repaired = repairJson(text);
+    if (repaired !== null) return repaired;
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
       try {
         return JSON.parse(match[0]);
       } catch {
-        return null;
+        return repairJson(match[0]);
       }
     }
     return null;
@@ -137,13 +189,14 @@ export function parseMatcherResponse(
       entry.index < 0 ||
       entry.index >= candidateCount ||
       seen.has(entry.index) ||
-      !Array.isArray(entry.matchedGoldenIndices)
+      (entry.matchedGoldenIndices !== undefined && !Array.isArray(entry.matchedGoldenIndices))
     ) {
       throw new Error("matcher returned invalid candidate finding entries");
     }
     seen.add(entry.index);
 
-    const matched = entry.matchedGoldenIndices.map((gi) => {
+    // a candidate entry with no matchedGoldenIndices field counts as "no match"
+    const matched = (entry.matchedGoldenIndices ?? []).map((gi) => {
       if (!Number.isInteger(gi) || gi < 0 || gi >= goldenCount) {
         throw new Error("matcher returned invalid golden finding indices");
       }
@@ -206,6 +259,11 @@ async function matchChunk(
     candidates.length,
     goldens.length,
   );
+
+  if (process.env.REVIEW_BENCH_DEBUG_MATCHER) {
+    appendFileSync(process.env.REVIEW_BENCH_DEBUG_MATCHER,
+      JSON.stringify({ prompt: userPrompt, response: responseText }) + "\n");
+  }
 
   // Remap candidate indices to global indices
   return localCorrespondences.map((c) => ({
